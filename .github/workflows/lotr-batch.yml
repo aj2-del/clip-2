@@ -1,0 +1,125 @@
+name: LOTR clips to Telegram
+
+# Manual run only - no schedule, no cron.
+# Run it from GitHub > Actions > LOTR clips to Telegram > Run workflow.
+on:
+  workflow_dispatch:
+    inputs:
+      max_per_category:
+        description: "Max clips per category (default 10)"
+        required: false
+        default: "10"
+      dry_run:
+        description: "Dry run only - cut, do NOT upload (true/false)"
+        required: false
+        default: "false"
+
+jobs:
+  lotr-batch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # GitHub kills a job at 6 hours - do not raise this
+    strategy:
+      fail-fast: false
+      matrix:
+        category: [landscape, battle, iconic]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check secrets are set - fail fast with a clear message
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "ERROR: GitHub Secrets are missing."
+            echo "Go to repo Settings > Secrets and variables > Actions and add:"
+            echo "  TELEGRAM_BOT_TOKEN"
+            echo "  TELEGRAM_CHAT_ID"
+            echo "Names must match exactly, no spaces. Then re-run the workflow."
+            exit 1
+          fi
+          if [ -z "$YOUTUBE_COOKIES" ]; then
+            echo "ERROR: YOUTUBE_COOKIES secret is missing."
+            echo "Add a Secret named YOUTUBE_COOKIES whose value is the full"
+            echo "contents of a Netscape-format youtube cookies.txt file"
+            echo "(first line: # Netscape HTTP Cookie File)."
+            echo "Export it fresh from your browser with a cookies.txt"
+            echo "extension for youtube.com, then paste the whole file text."
+            echo "Never paste cookie values into a workflow file or the repo."
+            exit 1
+          fi
+          echo "Secrets are set (values hidden). Continuing."
+
+      - name: Write cookies file from Secret (never printed)
+        env:
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+        run: |
+          printf '%s' "$YOUTUBE_COOKIES" > youtube_cookies.txt
+          chmod 600 youtube_cookies.txt
+          # Only check the shape, never print the contents.
+          head -n 1 youtube_cookies.txt | grep -q "Netscape HTTP Cookie File" || {
+            echo "ERROR: YOUTUBE_COOKIES does not look like a Netscape cookies.txt file."
+            echo "Its first line must be: # Netscape HTTP Cookie File"
+            exit 1
+          }
+          echo "Cookies file written: $(wc -l < youtube_cookies.txt) lines (values hidden)."
+
+      - name: Install ffmpeg, tesseract, yt-dlp
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg tesseract-ocr
+          pip install -U yt-dlp requests
+          ffmpeg -version | head -n 1
+          python3 -m yt_dlp --version
+
+      - name: HD probe - FAILS the job if YouTube blocks this runner
+        run: |
+          set -o pipefail
+          python3 -m yt_dlp --cookies youtube_cookies.txt -F https://www.youtube.com/watch?v=8oXedDVaK4Q > probe.txt 2>&1 || true
+          cat probe.txt
+          # This step now actually gates the run: it fails unless a 720p
+          # (or higher) format is listed. Before this fix the step piped
+          # to `head`, whose exit code was always 0, so it passed even
+          # when yt-dlp returned only storyboard formats.
+          if grep -q "Sign in to confirm" probe.txt; then
+            echo "ERROR: YouTube blocked this runner (bot check). Cancel the run."
+            exit 1
+          fi
+          if ! grep -Eq "720p|1080p|1440p|2160p" probe.txt; then
+            echo "ERROR: No HD format (720p+) found - this runner is blocked. Cancel the run."
+            exit 1
+          fi
+          echo "HD probe PASSED - a 720p+ format is available."
+
+      - name: Run LOTR batch (one category, with YouTube cookies)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            python3 lotr_telegram_batch_v2.py --category ${{ matrix.category }} --max-per-category ${{ inputs.max_per_category }} --cookies-file youtube_cookies.txt --dry-run
+          else
+            python3 lotr_telegram_batch_v2.py --category ${{ matrix.category }} --max-per-category ${{ inputs.max_per_category }} --cookies-file youtube_cookies.txt
+          fi
+
+      - name: Delete cookies file - always, even on failure
+        if: always()
+        run: rm -f youtube_cookies.txt probe.txt
+
+      - name: Upload tracking files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lotr-records-${{ matrix.category }}
+          path: |
+            sent_clips.json
+            sent_lotr_3cat_10s.json
+          if-no-files-found: warn
+          retention-days: 7
